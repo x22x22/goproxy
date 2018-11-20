@@ -11,22 +11,26 @@ import (
 	logger "log"
 	"net"
 	"net/url"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/snail007/goproxy/utils/dnsx"
+	"github.com/snail007/goproxy/utils/ip"
 	"github.com/snail007/goproxy/utils/mapx"
 	"github.com/snail007/goproxy/utils/sni"
 
 	"github.com/golang/snappy"
+	"gopkg.in/yaml.v2"
 )
 
 type Checker struct {
 	data             mapx.ConcurrentMap
 	blockedMap       mapx.ConcurrentMap
 	directMap        mapx.ConcurrentMap
+	ruleMap          ProxyRules
 	interval         int64
 	timeout          int
 	isStop           bool
@@ -41,10 +45,31 @@ type CheckerItem struct {
 	Lasttime     int64
 }
 
+type GlobalRule struct {
+	Hosts      []string `yaml:"hosts"`
+	Operation  string   `yaml:"op"`
+	TargetURIs []string `yaml:"TURI"`
+	Regexp     string   `yaml:"regexp"`
+}
+
+type Rule struct {
+	index      int
+	Name       string   `yaml:"name"`
+	Hosts      []string `yaml:"hosts"`
+	Operation  string   `yaml:"op"`
+	TargetURIs []string `yaml:"TURI"`
+	Regexp     string   `yaml:"regexp"`
+}
+
+type ProxyRules struct {
+	Global GlobalRule `yaml:"global"`
+	Rules  []Rule     `yaml:"rules"`
+}
+
 //NewChecker args:
 //timeout : tcp timeout milliseconds ,connect to host
 //interval: recheck domain interval seconds
-func NewChecker(timeout int, interval int64, blockedFile, directFile string, log *logger.Logger, CloseIntelligent bool) Checker {
+func NewChecker(timeout int, interval int64, blockedFile, directFile string, ruleFile string, log *logger.Logger, CloseIntelligent bool) Checker {
 	ch := Checker{
 		data:             mapx.NewConcurrentMap(),
 		interval:         interval,
@@ -53,13 +78,29 @@ func NewChecker(timeout int, interval int64, blockedFile, directFile string, log
 		closeIntelligent: CloseIntelligent,
 		log:              log,
 	}
-	ch.blockedMap = ch.loadMap(blockedFile)
-	ch.directMap = ch.loadMap(directFile)
+	if len(ruleFile) <= 0 {
+		ch.blockedMap = ch.loadMap(blockedFile)
+		ch.directMap = ch.loadMap(directFile)
+	} else {
+		ch.blockedMap = mapx.NewConcurrentMap()
+		ch.directMap = mapx.NewConcurrentMap()
+	}
+	ch.ruleMap = ch.loadMapByYml(ruleFile)
+	log.Printf("ch.ruleMap: %v", ch.ruleMap)
 	if !ch.blockedMap.IsEmpty() {
 		log.Printf("blocked file loaded , domains : %d", ch.blockedMap.Count())
 	}
 	if !ch.directMap.IsEmpty() {
 		log.Printf("direct file loaded , domains : %d", ch.directMap.Count())
+	}
+	globalRuleLen := 0
+	if len(ch.ruleMap.Global.Hosts) > 0 {
+		globalRuleLen = 1
+	}
+	rules := ch.ruleMap.Rules
+	ruleLen := globalRuleLen + len(rules)
+	if ruleLen > 0 {
+		log.Printf("proxyRule file loaded , rules : %d", ruleLen)
 	}
 	if interval > 0 {
 		ch.start()
@@ -81,6 +122,21 @@ func (c *Checker) loadMap(f string) (dataMap mapx.ConcurrentMap) {
 			if line != "" {
 				dataMap.Set(line, true)
 			}
+		}
+	}
+	return
+}
+func (c *Checker) loadMapByYml(f string) (data ProxyRules) {
+
+	if PathExists(f) {
+		_contents, err := ioutil.ReadFile(f)
+		if err != nil {
+			c.log.Printf("load file err:%s", err)
+			return
+		}
+		yamlErr := yaml.Unmarshal([]byte(_contents), &data)
+		if yamlErr != nil {
+			c.log.Printf("load file err:%s", yamlErr)
 		}
 	}
 	return
@@ -147,6 +203,90 @@ func (c *Checker) isNeedCheck(item CheckerItem) bool {
 	}
 	return true
 }
+
+func (c *Checker) RuleResult(domain string, sourceAddr string, targetURL string) (blocked, isInMap bool, failN, successN uint) {
+	globalRule := c.ruleMap.Global
+	rules := c.ruleMap.Rules
+	for index, value := range rules {
+		rules[index].index = index
+		if len(value.Hosts) <= 0 {
+			rules[index].Hosts = globalRule.Hosts
+		}
+		if len(value.Operation) <= 0 || value.Regexp == "null" {
+			rules[index].Operation = globalRule.Operation
+		}
+		if len(value.TargetURIs) <= 0 {
+			rules[index].TargetURIs = globalRule.TargetURIs
+		}
+		if len(value.Regexp) <= 0 || value.Regexp == "null" {
+			value.Regexp = globalRule.Regexp
+		}
+	}
+
+	sourceAddrObj := strings.Split(sourceAddr, ":")
+	sourceIP := net.ParseIP(sourceAddrObj[0])
+	if sourceIP == nil {
+		c.log.Printf("sourceAddr format is incorrect, sourceAddr: %s", sourceAddr)
+		return true, true, 0, 0
+	}
+	// 拒绝是true, 及走上级代理, 上级代理为不可通讯地址
+	operation := true
+	for _, value := range rules {
+		inHosts := false
+		inTargetURI := false
+		operation = true
+		for _, host := range value.Hosts {
+
+			if strings.Contains(host, "/") {
+				_, subnet, err := net.ParseCIDR(host)
+				if err != nil {
+					c.log.Printf("hosts format is incorrect, rule name: %s, rule host: %s", value.Name, value.Hosts)
+					return true, true, 0, 0
+				}
+				if subnet.Contains(sourceIP) {
+					inHosts = true
+					break
+				}
+			} else if strings.Contains(host, "-") {
+				IPs := strings.Split(host, "-")
+				startIP := net.ParseIP(IPs[0])
+				endIP := net.ParseIP(IPs[1])
+				if startIP == nil || endIP == nil {
+					c.log.Printf("hosts format is incorrect, rule name: %s, rule host: %s", value.Name, value.Hosts)
+					return true, true, 0, 0
+				} else if ip.IpBetween(net.ParseIP(IPs[0]), net.ParseIP(IPs[1]), sourceIP) {
+					inHosts = true
+					break
+				}
+			} else if net.ParseIP(host) != nil && host == sourceAddrObj[0] {
+				inHosts = true
+				break
+			}
+
+		}
+		if inHosts {
+			for _, TargetURI := range value.TargetURIs {
+				if value.Regexp != "true" && TargetURI == targetURL {
+					inTargetURI = true
+					break
+				} else {
+					reg := regexp.MustCompile(TargetURI)
+					if reg.MatchString(targetURL) {
+						inTargetURI = true
+						break
+					}
+
+				}
+			}
+		}
+		if inHosts && inTargetURI && value.Operation == "accept" {
+			operation = false
+			break
+		}
+	}
+	return operation, true, 0, 0
+}
+
 func (c *Checker) IsBlocked(domain string) (blocked, isInMap bool, failN, successN uint) {
 	h, _, _ := net.SplitHostPort(domain)
 	if h != "" {
@@ -406,8 +546,10 @@ func NewHTTPRequest(inConn *net.Conn, bufSize int, isBasicAuth bool, basicAuth *
 	log.Printf("%s:%s", req.Method, req.hostOrURL)
 
 	if req.IsHTTPS() {
+		req.URL = req.getHTTPSURL()
 		err = req.HTTPS()
 	} else {
+		req.URL = req.getHTTPURL()
 		err = req.HTTP()
 	}
 	return
@@ -506,6 +648,17 @@ func (req *HTTPRequest) getHTTPURL() (URL string) {
 		return
 	}
 	URL = fmt.Sprintf("http://%s%s", _host, req.hostOrURL)
+	return
+}
+func (req *HTTPRequest) getHTTPSURL() (URL string) {
+	if !strings.HasPrefix(req.hostOrURL, "/") {
+		return req.hostOrURL
+	}
+	_host := req.getHeader("host")
+	if _host == "" {
+		return
+	}
+	URL = fmt.Sprintf("https://%s%s", _host, req.hostOrURL)
 	return
 }
 func (req *HTTPRequest) getHeader(key string) (val string) {

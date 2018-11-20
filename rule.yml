@@ -1,0 +1,41 @@
+# 全局规则
+global:
+  hosts:
+    - 0.0.0.0/0
+  op: reject
+  # 模板URI
+  TURI:
+    - '.*'
+  regexp: true
+
+# 细规则
+# 如果细规则中某字段不存在则会被全局规则替换
+# 如果细规则中某字段存任何值全局规则对应的字段会被忽略
+# 可以用null强制不替换全局规则
+rules:
+  - name: test-1
+    hosts:
+      # 可以写成带掩码位的网段.
+      - 10.0.7.0/26
+      # 可以写成完整的网段范围.
+      - 10.0.8.1-10.0.8.254
+      - 127.0.0.1
+    op: accept
+    TURI:
+      - www.baidu.com
+      - www.sina.com.cn
+    regexp: true
+  - name: test-2
+    hosts:
+      # 可以写成单个IP.
+      - 10.1.64.9
+    op: accept
+    TURI:
+      # 带转义的字符必须用单引号或双引号括起来.
+      - '.*.qq.com/.*'
+    regexp: true
+  - name: test-3
+    hosts:
+      # 可以写成单个IP.
+      - 10.1.64.10
+    op: accept

@@ -42,6 +42,7 @@ type HTTPArgs struct {
 	Interval              *int
 	Blocked               *string
 	Direct                *string
+	Rule                  *string
 	AuthFile              *string
 	Auth                  *[]string
 	AuthURL               *string
@@ -187,7 +188,7 @@ func (s *HTTP) InitService() (err error) {
 	//init lb
 	if len(*s.cfg.Parent) > 0 {
 		s.log.Printf("CloseIntelligent: %v", *s.cfg.CloseIntelligent)
-		s.checker = utils.NewChecker(*s.cfg.HTTPTimeout, int64(*s.cfg.Interval), *s.cfg.Blocked, *s.cfg.Direct, s.log, *s.cfg.CloseIntelligent)
+		s.checker = utils.NewChecker(*s.cfg.HTTPTimeout, int64(*s.cfg.Interval), *s.cfg.Blocked, *s.cfg.Direct, *s.cfg.Rule, s.log, *s.cfg.CloseIntelligent)
 		s.InitLB()
 	}
 	if *s.cfg.DNSAddress != "" {
@@ -330,6 +331,7 @@ func (s *HTTP) callback(inConn net.Conn) {
 	}
 	var err interface{}
 	var req utils.HTTPRequest
+	// TODO: 这里可以获取到请求的url
 	req, err = utils.NewHTTPRequest(&inConn, 4096, s.IsBasicAuth(), &s.basicAuth, s.log)
 	if err != nil {
 		if err != io.EOF {
@@ -349,7 +351,18 @@ func (s *HTTP) callback(inConn net.Conn) {
 			useProxy = true
 		} else {
 			var isInMap bool
-			useProxy, isInMap, _, _ = s.checker.IsBlocked(address)
+
+			if *s.cfg.Rule != "" {
+				sourceAddr := inConn.RemoteAddr().String()
+				targetURL := req.Host
+				// reg := regexp.MustCompile("/$")
+				// if len(req.URL) > 0 && reg.MatchString(hostOrURL) {
+				// 	targetURL = hostOrURL + "/" + req.URL
+				// }
+				useProxy, isInMap, _, _ = s.checker.RuleResult(address, sourceAddr, targetURL)
+			} else {
+				useProxy, isInMap, _, _ = s.checker.IsBlocked(address)
+			}
 			if !isInMap {
 				s.checker.Add(address, s.Resolve(address))
 			}
@@ -370,6 +383,7 @@ func (s *HTTP) callback(inConn net.Conn) {
 	}
 }
 func (s *HTTP) OutToTCP(useProxy bool, address string, inConn *net.Conn, req *utils.HTTPRequest) (lbAddr string, err interface{}) {
+	// TODO: 可以获取到源主机地址
 	inAddr := (*inConn).RemoteAddr().String()
 	inLocalAddr := (*inConn).LocalAddr().String()
 	//防止死循环
